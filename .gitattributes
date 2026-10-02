@@ -1,0 +1,9 @@
+# 统一行尾为 LF，避免 Windows 宿主 checkout 时被转成 CRLF
+# （CRLF 会破坏 shell 脚本的 shebang，也会让 diff 产生噪声）
+* text=auto eol=lf
+
+# 显式声明，防止被 autocrlf 覆盖
+*.md   text eol=lf
+*.sh   text eol=lf
+*.ps1  text eol=crlf
+*.json text eol=lf
