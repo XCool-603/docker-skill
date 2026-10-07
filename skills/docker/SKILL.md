@@ -275,6 +275,40 @@ COPY --chown=app:app --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
 **1.7 非 root 不能监听 1024 以下端口。**
 容器内监听 `8080`，对外映射 `-p 80:8080`。别用 `setcap` 绕，那会削弱镜像安全性。
 
+**1.8 别把 build ARG 命名为 `UID` / `GID` / `HOME` / `PATH` —— 在 `RUN` 里会被 shell 的值盖掉。**
+
+`RUN` 里的变量展开发生在 **shell** 里，不是 Docker 里。而 `UID`、`EUID`、`HOME`、`PATH` 这些
+是 **shell 自己会设置的名字**（bash 里 `UID`/`EUID` 还是只读的）。于是：
+
+```dockerfile
+ARG UID=10001
+RUN useradd -m -u "${UID}" app        # ❌ 若 shell 定义了 UID，这里展开成 -u 0
+```
+
+```
+useradd: UID 0 is not unique
+```
+
+报错信息完全看不出根因——你明明写的是 10001。更麻烦的是它**依赖基础镜像的 shell**：
+同样的 Dockerfile 换个基镜像就可能从"正常"变成"构建失败"。
+
+```dockerfile
+ARG APP_UID=10001
+RUN useradd -m -u "${APP_UID}" app    # ✅ 换个不会撞名的名字
+```
+
+同理，任何"看起来像环境变量"的 ARG 名（`HOME`、`PATH`、`LANG`、`USER`）都可能被基镜像或 shell
+的预设值盖掉。**判断标准：这个名字如果是 shell 或基础镜像会自己设的，就别用作 ARG 名。**
+本文档前面模板里的 `ARG UID` / `ARG GID` 就是这个隐患——用的时候请改名。
+
+**附带一条**：需要校验属主时，**按用户名比较**，别用 `${UID}`：
+
+```dockerfile
+# ✅ 构建期自检：权限配错在构建时就炸，而不是等容器起来报 EACCES
+RUN test -x /usr/local/bin/entrypoint.sh \
+ && test "$(stat -c '%U:%G' /data)" = "app:app"
+```
+
 ---
 
 ## 2. 运行期权限
@@ -615,6 +649,7 @@ docker compose exec app curl -fsS http://host.docker.internal:8787/api/health
 | `groupadd: not found` / `useradd: not found` | 基镜像是 Alpine，没有 GNU 的 `useradd`/`groupadd` | 换 1.3 的 Alpine 版，或直接 `USER node` |
 | `groupadd: Permission denied` | 前面已切 `USER`，当前不是 root | 把 `USER` 移到最后 |
 | `adduser: uid '1000' is in use` | 基镜像已占用该 UID（`node`、`ubuntu` 镜像都用 1000:1000） | 换空闲 UID 或直接 `USER node`，见 1.3.1；**号是 `--build-arg` 传进来的**就改成容忍撞号，见 1.3.3 |
+| `useradd: UID 0 is not unique`（明明传的是非 0 的号） | build ARG 名叫 `UID`，在 `RUN` 里被 shell 的只读 `UID`（root 下为 0）盖掉 | ARG 改名 `APP_UID`，见 1.8 |
 | 构建在 `[2/N]` 那行失败，但**开发机上是好的** | UID/GID 来自构建参数，开发机用默认高位号、用户服务器传 `id -u`（=1000） | 见 1.3.3：探测占用、复用已有身份、全程用数字 ID |
 | 容器启动即 `permission denied: ./entrypoint.sh` | 脚本缺执行位（Windows 宿主常见） | `COPY --chmod=755` 或 `RUN chmod +x` |
 | `/bin/sh^M: bad interpreter` | CRLF 行尾 | `.gitattributes` 设 `*.sh text eol=lf` |
