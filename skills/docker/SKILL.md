@@ -57,6 +57,7 @@ RUN npm run build
 FROM node:22-slim AS runtime
 # 1) 固定 UID/GID，便于和宿主对齐（见"挂载与卷属主"）
 #    ⚠️ 下面两行是 Debian 版。Alpine 基镜像必须换成 1.3 的 Alpine 版。
+#    用 10001 而不是 1000：node/ubuntu 镜像已占用 1000，代入 1000 必报 uid in use（见 1.3.1）
 ARG UID=10001
 ARG GID=10001
 RUN groupadd -g "${GID}" app \
@@ -156,22 +157,41 @@ RUN addgroup -g "${GID}" app \
 | 不设密码 | 默认不设 | 加 `-D` 跳过设密码；不加 `-S` 时若也不给 `-D`，会尝试交互式设密码 |
 | nologin 路径 | `/usr/sbin/nologin` | `/sbin/nologin` |
 
-**1.3.1 写死 UID/GID 之前，先查基镜像占了哪些号。**
+**1.3.1 选 UID/GID —— "每次都卡在同一步"的头号原因。**
 
-`1000:1000` 是最常被基镜像占掉的号：**`node` 系列镜像已经建好 `node` 用户（UID/GID 1000）**，`ubuntu` 镜像有 `ubuntu` 用户（也是 1000）。照抄 1000 会得到：
+出现下面任一条，原因只有一个：**基镜像已经占了这个号**。
 
 ```
-adduser: uid '1000' is in use
+adduser: uid '1000' in use
+useradd: UID 1000 is not unique
 ```
 
-报错行看起来跟权限毫无关系，极易被误判成别的问题。构建前先确认：
+`node` 系列镜像内置 `node` 用户（**1000:1000**），`ubuntu` 镜像内置 `ubuntu`（**1000:1000**）。
+而宿主的 `id -u` 通常也是 1000 —— 所以"把镜像用户对齐成宿主 UID"这个直觉，在 node 镜像上**必然失败**。
+
+**按这个顺序决定，不要跳步：**
+
+| 场景 | 怎么做 |
+|---|---|
+| 官方镜像（`node` / `nginx` / `postgres`…） | **直接用镜像自带的用户**：`USER node`。不建用户就不可能撞号 |
+| 没有绑定挂载宿主目录 | **用 10001 这类高位号**，不要用 1000。命名卷不需要 UID 对齐 |
+| 确实要绑定挂载，且需要 UID 对齐 | 先查占用，再决定（见下） |
+
+**对齐前必须查占用：**
 
 ```bash
 docker run --rm <你的基础镜像> sh -c 'grep -E ":(1000|10001):" /etc/passwd /etc/group'
 ```
 
-（`grep -E` 在 busybox 和 Debian 上都有，可跨发行版使用。）确认没占用再定 UID/GID。
-用 `node` 镜像时更省事的做法：直接用现成的 `USER node`，不要另建用户。
+（`grep -E` 在 busybox 和 Debian 上都有，可跨发行版使用。）
+
+**如果宿主的 `id -u` 就是 1000，而镜像里已被占用，只有三条出路：**
+
+1. **改用命名卷**，放弃绑定挂载——多数情况下这才是正解；
+2. **换一个空闲 UID** 建用户，容器内以该 UID 运行（代价：不再与宿主一致）；
+3. **换基础镜像**：`node:22-slim` 没有预置用户，`node:22-alpine` 有 `node`。
+
+⚠️ **不要在撞号时改用 `useradd -o` 之类的强制选项**——那会造出两个同 UID 的用户，权限判定将不可预测。
 
 **1.3.2 HOME 必须存在且可写。**
 `-m` / `-h` 必须给：**用户没有 HOME 时，很多工具写 `~/.cache`、`~/.npm`、`~/.config` 会直接失败**，报错位置离根因很远。若不想建 home，就显式 `ENV HOME=/app XDG_CACHE_HOME=/tmp/.cache` 并保证该目录可写。
@@ -253,7 +273,7 @@ volumes:
   appdata: {}
 ```
 
-⚠️ 前提是**挂载点在镜像里已经存在且属主正确**。如果挂载的是镜像中不存在的路径，卷会是 `root:root`，属主不会自动对齐——先在 Dockerfile 里 `RUN install -d -o app -g app /app/data`。
+⚠️ 前提是**挂载点在镜像里已经存在且属主正确**。如果挂载的是镜像中不存在的路径，卷会是 `root:root`，属主不会自动对齐——先在 Dockerfile 里 `RUN mkdir -p /app/data && chown app:app /app/data`。
 
 **解法 2：对齐 UID/GID。**
 
@@ -264,14 +284,20 @@ docker run --user "$(id -u):$(id -g)" app:verify
 ```yaml
 services:
   app:
-    user: "${UID:-1000}:${GID:-1000}"
+    # 必须与镜像内用户的 UID 一致。不要用 1000 作默认值 —— 见 1.3.1
+    user: "${UID}:${GID}"
 ```
 
 前提是镜像里该 UID 对工作目录有读写权限。
-⚠️ 但 **1000 常常已被基镜像占用**（`node`、`ubuntu` 镜像都用 1000:1000，见 1.3.1）。
-宿主的 `id -u` 就是 1000 时，这个默认值会直接撞号——先查再填。
+⚠️ **`:-1000` 这种默认值本身就是陷阱**：宿主 `id -u` 通常是 1000，而 `node`、`ubuntu` 镜像
+**已经占用了 1000**，代入即报 `adduser: uid '1000' in use`。要么显式设值，要么干脆别用绑定挂载。
 
 **解法 3：构建期参数化 UID**，让镜像用户和宿主一致（模板里的 `ARG UID` / `ARG GID` 就是这个用途）。
+
+> ⚠️ **只在真的需要绑定挂载时才这么做。** 这是本 skill 里最容易引发构建失败的一条建议：
+> 宿主 `id -u` 通常是 1000，而 `node`、`ubuntu` 等镜像**已占用 1000**，直接代入必然报
+> `adduser: uid '1000' in use`。
+> **命名卷不需要 UID 对齐**——没有绑定挂载就别参数化，用 10001 这类高位号即可。决定前先读 1.3.1。
 
 **3.1 compose 默认以 root 运行**，在宿主机上生成的文件会变成 root 属主，之后宿主上的普通用户就改不动了。要么显式 `user:`，要么明确接受这个后果。
 
@@ -391,7 +417,7 @@ docker compose down
 | 运行期 `EACCES: ... open '/app/...'` | COPY 未 `--chown`，或绑定挂载盖掉属主 | `COPY --chown` / 换命名卷 / 对齐 UID |
 | 写 `~/.cache`、`$HOME` 失败 | 用户没有 HOME 或 HOME 不可写 | `useradd -m` 或 `ENV HOME=...` |
 | `bind: permission denied` 监听 80 | 非 root 不能绑 <1024 | 监听 8080 + `-p 80:8080` |
-| 卷内文件属主是 `root` | 挂载点在镜像中不存在 | 镜像里 `install -d -o app -g app` |
+| 卷内文件属主是 `root` | 挂载点在镜像中不存在 | 镜像里先 `mkdir -p` + `chown app:app` |
 | 容器里出现宿主的 `node_modules` | `.dockerignore` 漏排 | 加 `node_modules`、`.git` |
 | 改一行源码就重装依赖 | COPY 顺序错 | 先拷依赖清单再 `COPY . .` |
 | 构建上下文几百 MB / 极慢 | 缺 `.dockerignore` | 补 `.dockerignore` |
