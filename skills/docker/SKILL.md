@@ -121,7 +121,7 @@ RUN addgroup -g "${GID}" app \
 | 建组 | `groupadd -g GID app` | `addgroup -g GID app` |
 | 建用户 | `useradd -m -u UID -g app app` | `adduser -u UID -D -G app app` |
 | 建 home | `-m` | `-h DIR` |
-| 不设密码 | 默认不设 | **必须 `-D`**，否则会尝试交互式设密码 |
+| 不设密码 | 默认不设 | 加 `-D` 跳过设密码；不加 `-S` 时若也不给 `-D`，会尝试交互式设密码 |
 | nologin 路径 | `/usr/sbin/nologin` | `/sbin/nologin` |
 
 **1.3.1 写死 UID/GID 之前，先查基镜像占了哪些号。**
