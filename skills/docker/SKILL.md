@@ -1,6 +1,6 @@
 ---
 name: docker
-description: 'Use when writing, reviewing, or fixing a Dockerfile, .dockerignore, or docker-compose file, or when docker build/run/compose fails with permission denied, EACCES, ownership, entrypoint, packaging, layer-cache, image-size, container-name conflict, or a container cannot reach a service on the host. Covers build-time and runtime permission traps, bind-mount and named-volume ownership, root-to-non-root upgrades against existing volumes, compose container naming and host.docker.internal, multi-stage packaging, and running docker commands under the DSH sandbox on Windows.'
+description: 'Use when writing, reviewing, or fixing a Dockerfile, .dockerignore, or docker-compose file; when docker build/run/compose fails with permission denied, EACCES, ownership, packaging, layer-cache, container-name conflict, or a container cannot reach a host service; or when a deploy wrapper script (e.g. `sh scripts/docker.sh deploy`) is proposed or exists — this skill forbids wrapper scripts. Also covers bind-mount and named-volume ownership, root-to-non-root upgrades, compose naming and host.docker.internal, and running docker under the DSH sandbox on Windows.'
 ---
 
 # 写对 Docker：权限、打包与验证
@@ -85,7 +85,7 @@ FROM node:22-slim AS runtime
 # 1) 固定 UID/GID，便于和宿主对齐（见"挂载与卷属主"）
 #    ⚠️ 下面两行是 Debian 版。Alpine 基镜像必须换成 1.3 的 Alpine 版。
 #    用 10001 而不是 1000：node/ubuntu 镜像已占用 1000，代入 1000 必报 uid in use（见 1.3.1）
-#    ⚠️ 若这两个号是 --build-arg 从宿主传进来的（部署脚本常这么干，传的就是 1000），
+#    ⚠️ 若这两个号是 --build-arg 从宿主传进来的（CI/部署流程常这么干，传的就是 1000），
 #       上面这个写法在用户的服务器上必挂 —— 换成 1.3.3 的容忍写法。
 #    ⚠️ 名字必须叫 APP_UID/APP_GID，不能叫 UID/GID：RUN 里变量由 shell 展开，
 #       而 UID 在 bash 里是只读内置变量（root 下为 0），会盖掉 ARG（见 1.8）。
@@ -142,6 +142,44 @@ DSH 在 Windows 上的受限模式使用受限令牌，并向子进程管道的�
 - 受限模式下 `docker build` 的输出捕获也可能触发管道 `EPERM`。此时把输出重定向到文件（`docker build ... > build.log 2>&1`）或让 stdio 继承，而不是去改 Dockerfile。
 
 判断依据是**报错特征**，不要靠猜当前模式。
+
+---
+
+## 执行 docker：用原生命令，不要包装脚本
+
+**禁止用 `sh scripts/docker.sh deploy` 这类包装脚本。** 直接调 `docker` / `docker compose`：
+
+```bash
+docker compose up -d --build
+docker compose logs -f --tail=100
+docker compose down
+```
+
+四条理由，每条都对应一次实际的排查成本：
+
+- **报错被藏了一层**。脚本失败时你看到的是脚本自己的行号和退出码，而不是 docker 的原始报错；
+  每轮排查都要先"穿过"脚本，这是"反复改"的直接来源之一。
+- **脚本本身是新的故障面**。行尾、执行位、参数转义、`set -e` 行为，每一样都能单独炸
+  （第 6 节整节都是脚本在 Windows 上翻车的场景）。
+- **脚本会固化错误的值**。典型是把宿主 UID `1000` 硬编码进 `--build-arg`，
+  在别人的服务器上必然撞号（见 1.3.1、1.3.3）。
+- **它不提供任何 docker 没有的能力**。绝大多数包装脚本只是把几条命令拼起来。
+
+需要固定流程时，用 docker 自己的机制，而不是自己再写一层：
+
+| 想固定什么 | 用什么 |
+|---|---|
+| 启动顺序 | `depends_on` + `healthcheck` |
+| 构建参数 | `docker-compose.yml` 的 `build.args` |
+| 环境变量 | `env_file` / `environment` |
+| 重建策略 | `docker compose up -d --build` |
+| 定时更新 | 宿主 crontab 直接写 `docker compose` 命令，而不是调用脚本 |
+
+**已经存在的包装脚本**：删掉，把里面真正需要的命令收敛进 `docker-compose.yml`。
+不要"留着但不用"——留着就会被下一个 AI 或下一个人接着用。
+
+> ⚠️ 不用脚本**不等于**撞号问题消失：`build.args` 里照样可能传进 1000。
+> 所以 1.3.3 的"Dockerfile 自己容忍撞号"依然必须做。
 
 ---
 
@@ -232,14 +270,14 @@ docker run --rm <你的基础镜像> sh -c 'grep -E ":(1000|10001):" /etc/passwd
 1.3.1 的结论是"别撞号"，但那要求**你**能决定这个号。一旦号是别人传进来的，撞号就是必然而不是意外：
 
 ```bash
-# 部署脚本里几乎都会这么写（本项目就这么写，然后在用户的服务器上炸了）
+# CI / 部署流程常这么写：把宿主 UID 直接传进构建，然后在别人的服务器上炸
 docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
 ```
 
 Linux 宿主的 `id -u` 就是 1000，而 `node` / `ubuntu` 镜像正占着 1000:1000 —— 于是在**开发机上永远构建成功**
 （那里通常用默认的 10001），**只在用户的服务器上失败**，报错还停在 `[2/N]` 那一行。
 
-这时正确做法不是"在文档里提醒别传 1000"（没人会读，而且脚本是自动传的），而是**让 Dockerfile 自己容忍**：
+这时正确做法不是"在文档里提醒别传 1000"（没人会读，而且值是自动传进来的），而是**让 Dockerfile 自己容忍**：
 
 ```dockerfile
 ARG APP_UID=10001
@@ -540,7 +578,7 @@ Docker 是**逐行**解析 `.dockerignore` 的。在 `core.autocrlf=true` 的机
 .dockerignore text eol=lf
 ```
 
-同理，`.env` 这类"值必须精确"的文件也建议钉成 LF：部署脚本常用 `cut -d= -f2-` 取值，
+同理，`.env` 这类"值必须精确"的文件也建议钉成 LF：运维命令常用 `cut -d= -f2-` 取值，
 行尾的 `\r` 会悄悄进到口令、密钥里（表现为"密码明明对却登录不上"）。
 
 ---
@@ -642,7 +680,7 @@ docker rename redis redis-old     # 改名即可解封：不删数据、不影�
 ⚠️ **不要顺手 `docker rm -f redis`**：如果它是另一个应用正在用的 Redis，删了会打断那个应用；
 而且匿名卷会一起丢。要删也先 `docker rename`，确认没用之后再删。
 
-**预防**：除非确实需要固定名字（例如脚本里写死了 `docker exec shortdrama ...`），
+**预防**：除非确实需要固定名字（例如别处已经写死了 `docker exec shortdrama ...`），
 **不要设 `container_name`** —— 让 Compose 按 `<项目名>-<服务名>-1` 自动命名，天然不会跨项目冲突。
 
 **8.2 容器里的 `127.0.0.1` 是容器自己，不是宿主机。**
