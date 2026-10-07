@@ -60,10 +60,12 @@ FROM node:22-slim AS runtime
 #    用 10001 而不是 1000：node/ubuntu 镜像已占用 1000，代入 1000 必报 uid in use（见 1.3.1）
 #    ⚠️ 若这两个号是 --build-arg 从宿主传进来的（部署脚本常这么干，传的就是 1000），
 #       上面这个写法在用户的服务器上必挂 —— 换成 1.3.3 的容忍写法。
-ARG UID=10001
-ARG GID=10001
-RUN groupadd -g "${GID}" app \
- && useradd -m -u "${UID}" -g app -s /usr/sbin/nologin app
+#    ⚠️ 名字必须叫 APP_UID/APP_GID，不能叫 UID/GID：RUN 里变量由 shell 展开，
+#       而 UID 在 bash 里是只读内置变量（root 下为 0），会盖掉 ARG（见 1.8）。
+ARG APP_UID=10001
+ARG APP_GID=10001
+RUN groupadd -g "${APP_GID}" app \
+ && useradd -m -u "${APP_UID}" -g app -s /usr/sbin/nologin app
 
 WORKDIR /app
 ENV NODE_ENV=production \
@@ -140,13 +142,13 @@ COPY --chown=app:app . /app
 ```dockerfile
 # ── Debian / Ubuntu（node:22-slim、python:3.12-slim、ubuntu…）──
 # 注意：Debian 的 adduser 是 perl 脚本，参数与 busybox 完全不同，别用 adduser
-RUN groupadd -g "${GID}" app \
- && useradd -m -u "${UID}" -g app -s /usr/sbin/nologin app
+RUN groupadd -g "${APP_GID}" app \
+ && useradd -m -u "${APP_UID}" -g app -s /usr/sbin/nologin app
 
 # ── Alpine（node:22-alpine、nginx:alpine…）──
 # busybox 版：-D 跳过设密码，-G 指定主组，-h 指定 home
-RUN addgroup -g "${GID}" app \
- && adduser -u "${UID}" -D -G app -h /app -s /sbin/nologin app
+RUN addgroup -g "${APP_GID}" app \
+ && adduser -u "${APP_UID}" -D -G app -h /app -s /sbin/nologin app
 ```
 
 方言对照表（**左列参数不能出现在右列命令里，反之亦然**）：
@@ -204,7 +206,7 @@ docker run --rm <你的基础镜像> sh -c 'grep -E ":(1000|10001):" /etc/passwd
 
 ```bash
 # 部署脚本里几乎都会这么写（本项目就这么写，然后在用户的服务器上炸了）
-docker compose build --build-arg UID=$(id -u) --build-arg GID=$(id -g)
+docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
 ```
 
 Linux 宿主的 `id -u` 就是 1000，而 `node` / `ubuntu` 镜像正占着 1000:1000 —— 于是在**开发机上永远构建成功**
@@ -213,33 +215,33 @@ Linux 宿主的 `id -u` 就是 1000，而 `node` / `ubuntu` 镜像正占着 1000
 这时正确做法不是"在文档里提醒别传 1000"（没人会读，而且脚本是自动传的），而是**让 Dockerfile 自己容忍**：
 
 ```dockerfile
-ARG UID=10001
-ARG GID=10001
+ARG APP_UID=10001
+ARG APP_GID=10001
 
 RUN set -eux; \
     # 组：GID 空闲才建，否则复用现有组名（下面 adduser -G 需要名字）
-    if ! grep -qE ":${GID}:" /etc/group; then addgroup -g "${GID}" app; fi; \
+    if ! grep -qE ":${APP_GID}:" /etc/group; then addgroup -g "${APP_GID}" app; fi; \
     # 用户：UID 空闲才建；已被占用（例如 node:1000）就跳过，直接复用那个身份
-    if ! grep -qE ":${UID}:" /etc/passwd; then \
-      GROUP_NAME="$(awk -F: -v gid="${GID}" '$3 == gid { print $1 }' /etc/group)"; \
-      adduser -u "${UID}" -G "${GROUP_NAME}" -h /home/app -s /sbin/nologin -D app; \
+    if ! grep -qE ":${APP_UID}:" /etc/passwd; then \
+      GROUP_NAME="$(awk -F: -v gid="${APP_GID}" '$3 == gid { print $1 }' /etc/group)"; \
+      adduser -u "${APP_UID}" -G "${GROUP_NAME}" -h /home/app -s /sbin/nologin -D app; \
     fi; \
     mkdir -p /downloads /home/app/.cache; \
-    chown "${UID}:${GID}" /downloads /home/app/.cache
+    chown "${APP_UID}:${APP_GID}" /downloads /home/app/.cache
 
-COPY --chown=${UID}:${GID} . /app
-USER ${UID}:${GID}
+COPY --chown=${APP_UID}:${APP_GID} . /app
+USER ${APP_UID}:${APP_GID}
 ```
 
 两个容易漏的细节：
 
-- **全程用数字 ID**（`--chown=${UID}:${GID}`、`USER ${UID}:${GID}`）。复用已有用户时它的名字不叫 `app`，
+- **全程用数字 ID**（`--chown=${APP_UID}:${APP_GID}`、`USER ${APP_UID}:${APP_GID}`）。复用已有用户时它的名字不叫 `app`，
   任何写死名字的地方都会失败；
 - **用 `chown <uid>:<gid>`，不要用 `install -d -o <用户名>`**：后者要解析用户名，复用场景下直接报
   `install: unknown user`。（`grep`、`awk`、`mkdir`、`chown` 在 busybox 与 Debian 上都有，可跨发行版。）
 
 这样"新建"与"复用"两条路径都成立，同一个 Dockerfile 在干净镜像和宿主对齐两种场景下都能构建。
-**代价**：UID=0 也照样接受，所以如果确实要禁止 root，得自己加一道 `test "${UID}" != "0"`。
+**代价**：UID=0 也照样接受，所以如果确实要禁止 root，得自己加一道 `test "${APP_UID}" != "0"`。
 
 **1.4 包管理器在非 root 下会失败。**
 - `npm ci` / `npm i -g` 需要 root 或可写 prefix → 在 root 阶段装完再切 `USER`。
@@ -299,7 +301,7 @@ RUN useradd -m -u "${APP_UID}" app    # ✅ 换个不会撞名的名字
 
 同理，任何"看起来像环境变量"的 ARG 名（`HOME`、`PATH`、`LANG`、`USER`）都可能被基镜像或 shell
 的预设值盖掉。**判断标准：这个名字如果是 shell 或基础镜像会自己设的，就别用作 ARG 名。**
-本文档前面模板里的 `ARG UID` / `ARG GID` 就是这个隐患——用的时候请改名。
+本文档早先的模板就写作 `ARG UID` / `ARG GID`（已全部改名），照抄旧版本会踩这个坑。
 
 **附带一条**：需要校验属主时，**按用户名比较**，别用 `${UID}`：
 
@@ -367,11 +369,19 @@ services:
     user: "${UID}:${GID}"
 ```
 
+⚠️ 这里的 `${UID}` 是 **Compose 从环境变量插值**的，不是 shell 变量展开 ——
+而 shell 的 `UID`/`GID` **默认不导出**，所以直接 `docker compose up` 多半取到空值
+（插值成 `user: ":"`，容器起不来或行为怪异）。要么在 `.env` 里写死，要么显式传入：
+
+```bash
+UID=$(id -u) GID=$(id -g) docker compose up -d
+```
+
 前提是镜像里该 UID 对工作目录有读写权限。
 ⚠️ **`:-1000` 这种默认值本身就是陷阱**：宿主 `id -u` 通常是 1000，而 `node`、`ubuntu` 镜像
 **已经占用了 1000**，代入即报 `adduser: uid '1000' in use`。要么显式设值，要么干脆别用绑定挂载。
 
-**解法 3：构建期参数化 UID**，让镜像用户和宿主一致（模板里的 `ARG UID` / `ARG GID` 就是这个用途）。
+**解法 3：构建期参数化 UID**，让镜像用户和宿主一致（模板里的 `ARG APP_UID` / `ARG APP_GID` 就是这个用途）。
 
 > ⚠️ **只在真的需要绑定挂载时才这么做。** 这是本 skill 里最容易引发构建失败的一条建议：
 > 宿主 `id -u` 通常是 1000，而 `node`、`ubuntu` 等镜像**已占用 1000**，直接代入必然报
@@ -538,7 +548,7 @@ docker run --rm -v appdata:/app/data app:verify sh -c 'touch /app/data/.w && rm 
 
 ```bash
 # 1000 是 node/ubuntu 镜像自带的号，也正是宿主机上 id -u 的常见值
-docker build --build-arg UID=1000 --build-arg GID=1000 -t app:uid1000 .
+docker build --build-arg APP_UID=1000 --build-arg APP_GID=1000 -t app:uid1000 .
 docker run --rm app:uid1000 id -u                                   # 期望：1000（不是 0，也不该构建失败）
 docker run --rm app:uid1000 sh -c 'touch "$PWD/.w" && rm "$PWD/.w"'
 docker run --rm -v appdata1000:/app/data app:uid1000 sh -c 'touch /app/data/.w && rm /app/data/.w'
