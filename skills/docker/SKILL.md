@@ -12,7 +12,37 @@ AI 生成的 Docker 出问题，绝大多数不是"不会写语法"，而是**�
 
 所有 `EACCES` / `permission denied` / 打包反复出 bug，几乎都能归到"这两套身份之间没有交接清楚"。**改 Dockerfile 之前先判断问题属于哪一类，不要靠试。**
 
-## 最小正确模板
+## 开工前必做：确认基镜像是哪个发行版
+
+**建用户/建组的命令是发行版专属的，用错一定构建失败。** 这一步优先于后面所有规则——先做它，再写别的。
+
+```bash
+docker run --rm <你的基础镜像> sh -c 'command -v useradd groupadd adduser addgroup; echo "---"; head -2 /etc/os-release'
+```
+
+| 输出 | 基镜像 | 用哪套 |
+|---|---|---|
+| 有 `useradd`、`groupadd` | Debian / Ubuntu | 下方模板（GNU 版） |
+| 只有 `adduser`、`addgroup` | Alpine | 1.3 的 Alpine 版 |
+| 两个都没有 | distroless / scratch | 根本不能建用户，见 4.4 |
+
+**这一步没做时，报错长这样**——出现任何一条，都说明你跳过了它，而问题不在权限配置上：
+
+| 报错 | 真实原因 |
+|---|---|
+| `groupadd: not found` / `useradd: not found` | 基镜像是 Alpine。`useradd` 由 `shadow` 包提供，Alpine 基础镜像**默认没装** |
+| `adduser: Unknown option` / `addgroup: invalid option` | 基镜像是 Debian，却在用 busybox 参数 |
+| `adduser: uid '1000' is in use` | 该 UID 已被基镜像占用（`node`、`ubuntu` 镜像都用 1000:1000） |
+| `groupadd: Permission denied` | 前面的步骤已经切过 `USER`，当前不是 root |
+
+> 💡 **最省事的做法：别自己建用户。** 官方镜像通常已经备好非 root 用户——`node` 镜像有 `node`（UID 1000）、`nginx` 有 `nginx`、`postgres` 有 `postgres`。直接 `USER node` 就能一次性绕开整套方言问题。
+
+---
+
+## 最小正确模板（**Debian / Ubuntu 基镜像**）
+
+> ⚠️ 这个骨架假定 `FROM` 是 Debian 系。**如果你的 `FROM` 是 Alpine，下面创建用户那两行必须换成 1.3 的 Alpine 版**——照抄会直接报 `groupadd: not found`。
+> 这就是"每次都在同一步失败"最常见的原因：模板的发行版和实际 `FROM` 对不上。
 
 新写 Dockerfile 时从这个骨架开始，它已经规避了下面大部分坑：
 
@@ -26,6 +56,7 @@ RUN npm run build
 
 FROM node:22-slim AS runtime
 # 1) 固定 UID/GID，便于和宿主对齐（见"挂载与卷属主"）
+#    ⚠️ 下面两行是 Debian 版。Alpine 基镜像必须换成 1.3 的 Alpine 版。
 ARG UID=10001
 ARG GID=10001
 RUN groupadd -g "${GID}" app \
@@ -36,7 +67,8 @@ ENV NODE_ENV=production \
     HOME=/home/app
 
 # 2) 先建目录并交给 app，再拷产物；--chown 让运行期用户可写
-RUN install -d -o app -g app /app
+#    用 mkdir + chown，不用 install -d -o/-g —— 前者在 Debian 和 Alpine 上行为一致
+RUN mkdir -p /app && chown app:app /app
 COPY --from=builder --chown=app:app /src/dist ./dist
 COPY --chown=app:app --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
@@ -93,7 +125,7 @@ DSH 在 Windows 上的受限模式使用受限令牌，并向子进程管道的�
 COPY --chown=app:app . /app
 ```
 
-不要用 `RUN chown -R app:app /app`——它多生成一整个数据层（镜像变大、构建变慢），而且顺序写错（chown 之后再 COPY）就完全失效。`--chown` 只管 COPY 进来的内容，所以**在镜像里新建的目录要单独 `RUN install -d -o app -g app /app`**。
+不要用 `RUN chown -R app:app /app`——它多生成一整个数据层（镜像变大、构建变慢），而且顺序写错（chown 之后再 COPY）就完全失效。`--chown` 只管 COPY 进来的内容，所以**在镜像里新建的目录要单独 `RUN mkdir -p /app && chown app:app /app`**。
 
 **1.3 建用户：Debian/Ubuntu 与 Alpine 是两套互不兼容的方言，混用必定在 `[2/N]` 这一步构建失败。**
 
@@ -351,6 +383,8 @@ docker compose down
 |---|---|---|
 | `RUN` 步骤里 `Permission denied` | `USER` 切换过早 | `USER` 移到最后 |
 | `adduser: Unknown option` / `addgroup: invalid option -- 'g'` | **发行版方言用错**：Alpine(busybox) 参数用在 Debian 上，或反之 | 按 `FROM` 选对应方言，见 1.3 |
+| `groupadd: not found` / `useradd: not found` | 基镜像是 Alpine，没有 GNU 的 `useradd`/`groupadd` | 换 1.3 的 Alpine 版，或直接 `USER node` |
+| `groupadd: Permission denied` | 前面已切 `USER`，当前不是 root | 把 `USER` 移到最后 |
 | `adduser: uid '1000' is in use` | 基镜像已占用该 UID（`node`、`ubuntu` 镜像都用 1000:1000） | 换空闲 UID 或直接 `USER node`，见 1.3.1 |
 | 容器启动即 `permission denied: ./entrypoint.sh` | 脚本缺执行位（Windows 宿主常见） | `COPY --chmod=755` 或 `RUN chmod +x` |
 | `/bin/sh^M: bad interpreter` | CRLF 行尾 | `.gitattributes` 设 `*.sh text eol=lf` |
