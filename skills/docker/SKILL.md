@@ -12,13 +12,26 @@ AI 生成的 Docker 出问题，绝大多数不是"不会写语法"，而是**�
 
 所有 `EACCES` / `permission denied` / 打包反复出 bug，几乎都能归到"这两套身份之间没有交接清楚"。**改 Dockerfile 之前先判断问题属于哪一类，不要靠试。**
 
-## 开工前必做：确认基镜像是哪个发行版
+## 开工前必做：确认基镜像是哪个发行版、以及它**已经有哪些用户**
 
 **建用户/建组的命令是发行版专属的，用错一定构建失败。** 这一步优先于后面所有规则——先做它，再写别的。
 
 ```bash
-docker run --rm <你的基础镜像> sh -c 'command -v useradd groupadd adduser addgroup; echo "---"; head -2 /etc/os-release'
+docker run --rm <你的基础镜像> sh -c 'command -v useradd groupadd adduser addgroup; echo "---"; head -2 /etc/os-release; echo "--- 已存在的用户/组:"; id; getent passwd | tail -3; echo "APP_UID=$APP_UID"'
 ```
+
+**后半段（已存在的用户）和前半段同样重要**：很多官方镜像已经内置了非 root 用户，
+你却去建一个**同名**用户 —— 报错是 `groupadd` 退出码 9（组名已存在），
+而 Docker 只打印一行 `did not complete successfully: exit code: 9`，看不出任何原因。
+
+已知的内置非 root 用户：
+
+| 基础镜像 | 内置用户 | 备注 |
+|---|---|---|
+| `node:*` | `node`（1000:1000） | |
+| `nginx:*` | `nginx` | |
+| `postgres:*` | `postgres` | |
+| **`mcr.microsoft.com/dotnet/aspnet` / `runtime`（8.0+）** | **`app`（1654:1654）** | 名字就叫 `app`，与本文档模板里的用户名**正好撞车**；是 `--no-create-home` 建的，HOME 要自己建 |
 
 | 输出 | 基镜像 | 用哪套 |
 |---|---|---|
@@ -34,8 +47,22 @@ docker run --rm <你的基础镜像> sh -c 'command -v useradd groupadd adduser 
 | `adduser: Unknown option` / `addgroup: invalid option` | 基镜像是 Debian，却在用 busybox 参数 |
 | `adduser: uid '1000' is in use` | 该 UID 已被基镜像占用（`node`、`ubuntu` 镜像都用 1000:1000） |
 | `groupadd: Permission denied` | 前面的步骤已经切过 `USER`，当前不是 root |
+| `did not complete successfully: exit code: 9` | `groupadd` 的「**组名已存在**」——你要建的组名撞上了镜像内置的组（如 .NET 镜像的 `app`） |
 
-> 💡 **最省事的做法：别自己建用户。** 官方镜像通常已经备好非 root 用户——`node` 镜像有 `node`（UID 1000）、`nginx` 有 `nginx`、`postgres` 有 `postgres`。直接 `USER node` 就能一次性绕开整套方言问题。
+> 💡 **最省事的做法：别自己建用户。** 官方镜像通常已经备好非 root 用户——
+> `node` 镜像有 `node`（UID 1000）、`nginx` 有 `nginx`、`postgres` 有 `postgres`、
+> **.NET 镜像有 `app`（UID 1654）**。直接 `USER node` / `USER app` 就能一次性绕开整套方言与撞号问题。
+> 本文档下面的模板是"**没有**内置用户时"的写法，用之前先确认目标镜像里确实没有同名用户。
+
+> 🔍 **`did not complete successfully: exit code: N` 本身不告诉你任何事。**
+> 把那条 `RUN` 的命令**原样**在容器里跑一遍就能看到真实报错：
+>
+> ```bash
+> docker run --rm <基础镜像> sh -c 'groupadd -g 10001 app; echo "退出码=$?"'
+> ```
+>
+> 建用户/建组类命令的退出码是标准化的（`groupadd`：3=参数非法、4=GID 重复、9=组名重复；
+> `useradd`：4=UID 重复、9=用户名重复、12=建 home 失败）。**看到码先查语义，别急着改 Dockerfile。**
 
 ---
 
@@ -660,6 +687,7 @@ docker compose exec app curl -fsS http://host.docker.internal:8787/api/health
 | `groupadd: Permission denied` | 前面已切 `USER`，当前不是 root | 把 `USER` 移到最后 |
 | `adduser: uid '1000' is in use` | 基镜像已占用该 UID（`node`、`ubuntu` 镜像都用 1000:1000） | 换空闲 UID 或直接 `USER node`，见 1.3.1；**号是 `--build-arg` 传进来的**就改成容忍撞号，见 1.3.3 |
 | `useradd: UID 0 is not unique`（明明传的是非 0 的号） | build ARG 名叫 `UID`，在 `RUN` 里被 shell 的只读 `UID`（root 下为 0）盖掉 | ARG 改名 `APP_UID`，见 1.8 |
+| `did not complete successfully: exit code: 9`（建组那一步） | `groupadd` 的「组名已存在」：镜像**内置**了同名组（.NET 镜像内置 `app`，正是模板常用的名字） | 别自建用户，直接用内置的 `USER app`；或换个不撞名的名字。见「开工前必做」 |
 | 构建在 `[2/N]` 那行失败，但**开发机上是好的** | UID/GID 来自构建参数，开发机用默认高位号、用户服务器传 `id -u`（=1000） | 见 1.3.3：探测占用、复用已有身份、全程用数字 ID |
 | 容器启动即 `permission denied: ./entrypoint.sh` | 脚本缺执行位（Windows 宿主常见） | `COPY --chmod=755` 或 `RUN chmod +x` |
 | `/bin/sh^M: bad interpreter` | CRLF 行尾 | `.gitattributes` 设 `*.sh text eol=lf` |
