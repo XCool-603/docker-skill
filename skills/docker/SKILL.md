@@ -95,18 +95,53 @@ COPY --chown=app:app . /app
 
 不要用 `RUN chown -R app:app /app`——它多生成一整个数据层（镜像变大、构建变慢），而且顺序写错（chown 之后再 COPY）就完全失效。`--chown` 只管 COPY 进来的内容，所以**在镜像里新建的目录要单独 `RUN install -d -o app -g app /app`**。
 
-**1.3 建用户：Debian/Ubuntu 与 Alpine 参数不同，别混用。**
+**1.3 建用户：Debian/Ubuntu 与 Alpine 是两套互不兼容的方言，混用必定在 `[2/N]` 这一步构建失败。**
+
+> ⚠️ 这是整份 skill 最容易踩坏的一步。两段代码长得像，参数却完全不通用：
+> 把 `-D` / `-G` / `-h` 这类 busybox 参数用在 Debian 上，或把 `-m` 用在 Alpine 上，
+> 都会直接报 `Unknown option` / `invalid option`。
+> **先看 `FROM` 是哪个发行版，再选对应的一段，不要凭印象拼。**
 
 ```dockerfile
-# Debian / Ubuntu
-RUN groupadd -g 10001 app \
- && useradd -m -u 10001 -g app -s /usr/sbin/nologin app
+# ── Debian / Ubuntu（node:22-slim、python:3.12-slim、ubuntu…）──
+# 注意：Debian 的 adduser 是 perl 脚本，参数与 busybox 完全不同，别用 adduser
+RUN groupadd -g "${GID}" app \
+ && useradd -m -u "${UID}" -g app -s /usr/sbin/nologin app
 
-# Alpine（busybox adduser，参数不一样）
-RUN addgroup -g 10001 -S app \
- && adduser -u 10001 -S -G app -h /app -s /sbin/nologin app
+# ── Alpine（node:22-alpine、nginx:alpine…）──
+# busybox 版：-D 跳过设密码，-G 指定主组，-h 指定 home
+RUN addgroup -g "${GID}" app \
+ && adduser -u "${UID}" -D -G app -h /app -s /sbin/nologin app
 ```
 
+方言对照表（**左列参数不能出现在右列命令里，反之亦然**）：
+
+| 用途 | Debian / Ubuntu | Alpine（busybox） |
+|---|---|---|
+| 建组 | `groupadd -g GID app` | `addgroup -g GID app` |
+| 建用户 | `useradd -m -u UID -g app app` | `adduser -u UID -D -G app app` |
+| 建 home | `-m` | `-h DIR` |
+| 不设密码 | 默认不设 | **必须 `-D`**，否则会尝试交互式设密码 |
+| nologin 路径 | `/usr/sbin/nologin` | `/sbin/nologin` |
+
+**1.3.1 写死 UID/GID 之前，先查基镜像占了哪些号。**
+
+`1000:1000` 是最常被基镜像占掉的号：**`node` 系列镜像已经建好 `node` 用户（UID/GID 1000）**，`ubuntu` 镜像有 `ubuntu` 用户（也是 1000）。照抄 1000 会得到：
+
+```
+adduser: uid '1000' is in use
+```
+
+报错行看起来跟权限毫无关系，极易被误判成别的问题。构建前先确认：
+
+```bash
+docker run --rm <你的基础镜像> sh -c 'grep -E ":(1000|10001):" /etc/passwd /etc/group'
+```
+
+（`grep -E` 在 busybox 和 Debian 上都有，可跨发行版使用。）确认没占用再定 UID/GID。
+用 `node` 镜像时更省事的做法：直接用现成的 `USER node`，不要另建用户。
+
+**1.3.2 HOME 必须存在且可写。**
 `-m` / `-h` 必须给：**用户没有 HOME 时，很多工具写 `~/.cache`、`~/.npm`、`~/.config` 会直接失败**，报错位置离根因很远。若不想建 home，就显式 `ENV HOME=/app XDG_CACHE_HOME=/tmp/.cache` 并保证该目录可写。
 
 **1.4 包管理器在非 root 下会失败。**
@@ -201,6 +236,8 @@ services:
 ```
 
 前提是镜像里该 UID 对工作目录有读写权限。
+⚠️ 但 **1000 常常已被基镜像占用**（`node`、`ubuntu` 镜像都用 1000:1000，见 1.3.1）。
+宿主的 `id -u` 就是 1000 时，这个默认值会直接撞号——先查再填。
 
 **解法 3：构建期参数化 UID**，让镜像用户和宿主一致（模板里的 `ARG UID` / `ARG GID` 就是这个用途）。
 
@@ -313,6 +350,8 @@ docker compose down
 | 报错 / 现象 | 根因 | 修法 |
 |---|---|---|
 | `RUN` 步骤里 `Permission denied` | `USER` 切换过早 | `USER` 移到最后 |
+| `adduser: Unknown option` / `addgroup: invalid option -- 'g'` | **发行版方言用错**：Alpine(busybox) 参数用在 Debian 上，或反之 | 按 `FROM` 选对应方言，见 1.3 |
+| `adduser: uid '1000' is in use` | 基镜像已占用该 UID（`node`、`ubuntu` 镜像都用 1000:1000） | 换空闲 UID 或直接 `USER node`，见 1.3.1 |
 | 容器启动即 `permission denied: ./entrypoint.sh` | 脚本缺执行位（Windows 宿主常见） | `COPY --chmod=755` 或 `RUN chmod +x` |
 | `/bin/sh^M: bad interpreter` | CRLF 行尾 | `.gitattributes` 设 `*.sh text eol=lf` |
 | 运行期 `EACCES: ... open '/app/...'` | COPY 未 `--chown`，或绑定挂载盖掉属主 | `COPY --chown` / 换命名卷 / 对齐 UID |
