@@ -675,6 +675,45 @@ services:
 docker compose exec app curl -fsS http://host.docker.internal:8787/api/health
 ```
 
+**8.3 面板/编排工具的「更新容器」会把动态 IP 固化成静态 IP。**
+
+报错长这样：
+
+```
+Error response from daemon: invalid config for network <项目>_default: invalid endpoint settings:
+user specified IP address is supported only when connecting to networks with user configured subnets
+```
+
+根因：宝塔 / 1Panel 这类面板的「更新容器」**不是在跑 compose**，而是把面板记录的容器参数
+搬到新容器上。它从 `docker inspect` 读到当前分配的 IP，回填成 `ipv4_address`；
+而 compose 自动创建的网络（`<项目>_default`）**没有用户配置的子网**（Docker 自动分配），
+于是静态 IP 不合法 → 新容器创建失败（面板通常还会"恢复原容器"）。
+
+**先确认是不是这个原因**：
+
+```bash
+# 网络有没有自定义子网？（输出为空/无 Subnet 就是没有）
+docker network inspect <项目>_default --format '{{json .IPAM.Config}}'
+# 容器有没有被请求静态 IP？（IPAMConfig 非 null 就是有）
+docker inspect <容器名> --format '{{json .NetworkSettings.Networks}}'
+```
+
+**修法：让 compose 管这个容器，别用面板的「更新容器」。**
+
+```bash
+docker compose down && docker compose up -d
+```
+
+compose 知道期望状态，重建时会用动态 IP；面板则会把"当前状态"当"期望状态"再应用一遍 ——
+所以**改了 compose 之后点面板更新，应用的仍是旧参数**（配置漂移），这是同一根源的另一面。
+
+如果必须用面板管理，就在面板里把该容器的**静态 IP 留空**。
+不推荐"给网络写死一个子网"来迁就它：写死的子网可能和宿主已有网段冲突，导致网络直接创建失败。
+
+**通用教训**：编排工具的"更新/重建"按钮与 `docker compose` 是两套期望状态来源。
+选一个用，别混用 —— 混用的症状就是"配置明明改了却不生效"或"重建就报网络错误"。
+
+
 ---
 
 ## 9. 症状 → 根因速查
@@ -704,6 +743,7 @@ docker compose exec app curl -fsS http://host.docker.internal:8787/api/health
 | 容器里连不上"本机服务"（源码运行却正常） | 容器里的 `127.0.0.1` 指容器自己 | 改 `host.docker.internal` + `extra_hosts: host-gateway`；见 8.2 |
 | 升级后突然写不进数据卷（`EACCES`、`unable to open database file`） | 从 root 切非 root，而**已有的卷**是 root 属主（只有新建的空卷才继承镜像属主） | 入口脚本 chown 后降权，或文档给一次性 chown；见 3.3 |
 | `.dockerignore` 里写了规则却没生效 | 行尾是 CRLF，规则被解析成 `node_modules/\r` | `.gitattributes` 加 `.dockerignore text eol=lf`；见 5.5 |
+| `user specified IP address is supported only when connecting to networks with user configured subnets` | 面板/编排工具的「更新容器」把动态 IP 回填成了静态 IP，而 compose 默认网络没有自定义子网 | 改用 `docker compose up -d` 重建；或在面板里把静态 IP 留空；见 8.3 |
 | `open //./pipe/docker*: Access is denied` | DSH 受限模式（**非 Dockerfile 问题**） | 见第 0 节，申请完全权限 |
 
 ---
