@@ -784,6 +784,48 @@ curl -fsS http://127.0.0.1:18080/health            # ③ 本机通吗
 > 换一个冷门端口（如 18080）成本极低；而**容器内端口保持 8080 即可** ——
 > 容器内的端口是隔离的，不存在冲突，改它只会多改一堆地方（`EXPOSE`、`ASPNETCORE_URLS`、健康检查）。
 
+**8.5 运行端口必须显式配置（硬性要求）。**
+
+**每个需要被访问的服务，都必须在 compose 里写出端口映射。** 不能依赖框架默认值，也不能"先不写、等访问不到再说"——缺了它，症状就是"容器明明在跑，却怎么也连不上"。
+
+三处端口必须**同时存在且互相一致**，缺任何一处都会表现为"打不开"：
+
+| 层 | 写在哪 | 作用 | 漏了会怎样 |
+|---|---|---|---|
+| 应用监听 | 代码 / `ASPNETCORE_URLS` / `PORT` | 真正决定进程听哪个端口 | 容器内没人在听，映射再对也没用 |
+| 容器内端口 | Dockerfile `EXPOSE` | 只是文档与 `-P` 的依据，**不改变实际监听** | 不影响连通，但别人看不出该映哪个端口 |
+| 对外映射 | compose `ports: "<对外>:<容器内>"` | 把容器内端口发布到宿主 | 宿主上没有 LISTEN，外网必然访问不到 |
+
+```yaml
+services:
+  api:
+    build: .
+    environment:
+      # 让应用监听容器内端口 —— 必须与下面 ports 的右侧一致
+      ASPNETCORE_URLS: "http://+:8080"
+    ports:
+      # 对外 18080 → 容器内 8080
+      - "${APP_PORT:-18080}:8080"
+    healthcheck:
+      # 健康检查用容器内端口，不是对外端口
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+```
+
+**写完 compose 必做的四项检查：**
+
+```bash
+docker compose config | grep -A3 ports    # 确认 ports 真的存在、变量插值取到了期望值
+docker compose ps                          # 确认对外端口已列出
+ss -lntp | grep 18080                      # 确认宿主在监听，且绑定 0.0.0.0 而非 127.0.0.1
+curl -fsS http://127.0.0.1:18080/health    # 确认真的通
+```
+
+**三条禁令：**
+
+- **不要不写 `ports:` 就交付**——那等于交付一个访问不到的服务。
+- **不要把对外端口写死成 `8080`**（理由见 8.4）。用 `${APP_PORT:-18080}` 这类变量，换端口时不必改代码。
+- **不要以为写了 `expose:` 就等于暴露了**——`expose` 只对同一网络内的其它容器可见，**不会**发布到宿主。
+
 
 
 ---
@@ -816,6 +858,7 @@ curl -fsS http://127.0.0.1:18080/health            # ③ 本机通吗
 | 升级后突然写不进数据卷（`EACCES`、`unable to open database file`） | 从 root 切非 root，而**已有的卷**是 root 属主（只有新建的空卷才继承镜像属主） | 入口脚本 chown 后降权，或文档给一次性 chown；见 3.3 |
 | `.dockerignore` 里写了规则却没生效 | 行尾是 CRLF，规则被解析成 `node_modules/\r` | `.gitattributes` 加 `.dockerignore text eol=lf`；见 5.5 |
 | `user specified IP address is supported only when connecting to networks with user configured subnets` | 面板/编排工具的「更新容器」把动态 IP 回填成了静态 IP，而 compose 默认网络没有自定义子网 | 改用 `docker compose up -d` 重建；或在面板里把静态 IP 留空；见 8.3 |
+| 容器在跑但**访问不到**，宿主 `ss -lntp` 无 LISTEN | compose 里没写 `ports:`，或只写了 `expose:`（`expose` 不发布到宿主） | 补 `ports: "<对外>:<容器内>"`，右侧必须等于应用实际监听端口；见 8.5 |
 | `open //./pipe/docker*: Access is denied` | DSH 受限模式（**非 Dockerfile 问题**） | 见第 0 节，申请完全权限 |
 
 ---
@@ -830,3 +873,4 @@ curl -fsS http://127.0.0.1:18080/health            # ③ 本机通吗
 5. 配置里的 `127.0.0.1` 是**从哪一侧**访问的？宿主上跑得通不代表容器里跑得通（第 8.2 节）。
 6. 这次改动会不会**只在新环境成立**？改属主、改 UID、加 `USER` 时，想想**已有数据卷**的老用户（第 3.3 节）。
 7. 我这次改动**验证过**了吗？没验证就不要说"修好了"——并说清哪些验了、哪些没验。
+8. **运行端口配了吗？** 应用监听端口、`EXPOSE`、`ports:` 右侧三者是否一致；对外端口是否可覆盖、是否避开了 8080（第 8.5 节）。
